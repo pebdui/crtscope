@@ -25,6 +25,10 @@ brighter. In quiet moments it settles back to a dim, steady picture.
 python3 crtscope.py logo.png
 ```
 
+Or skip the command line: press **Tab** while it's running to browse your
+`~/Pictures` folder, then pick an image with the arrow keys and Enter. The menu
+also has an entry to go back to the plain scope.
+
 Logos, line art, icons and high-contrast pictures work best; busy photos turn
 into a lot of little squiggles. Transparent PNGs use their shape's edge.
 `+` / `-` set how strongly the music bends the lines.
@@ -60,6 +64,7 @@ into a glowing ball of noise, as they would on a real scope.
 
 | Key | Does |
 | --- | --- |
+| Tab | browse ~/Pictures and pick an image to trace (↑↓ Enter, ← back, Tab/Esc close) |
 | `p` | next phosphor |
 | `m` | XY / goniometer (mono shows as a vertical line) |
 | `[` / `]` | shorter / longer afterglow |

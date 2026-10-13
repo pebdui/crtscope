@@ -5,7 +5,8 @@ Left channel moves the beam sideways, right channel moves it up and down, so
 stereo music draws Lissajous figures. The beam leaves phosphor glow behind that
 fades over time, and it glows brighter where it moves slowly.
 
-Give it an image (crtscope picture.png) and the beam traces the picture's
+Give it an image (crtscope picture.png, or press Tab to pick one from
+~/Pictures) and the beam traces the picture's
 outlines instead: the music bends the lines, bass makes it pulse, and loudness
 makes the beam burn brighter.
 
@@ -16,6 +17,7 @@ Keys (while running):
   + / -  gain (wobble, with an image)   a       auto gain on/off
   g      graticule on/off               o       round tube / square screen
   < >    squash / stretch sideways, if your terminal makes the tube oval
+  Tab    browse your pictures and pick one to trace (or go back to the scope)
   h      hide the info bar              q / Esc quit
 """
 
@@ -288,7 +290,9 @@ def load_outline(path, max_points=4000):
     True where the beam has to jump to a separate shape with the beam off."""
     from PIL import Image, ImageOps
 
-    im = ImageOps.exif_transpose(Image.open(path))
+    im = Image.open(path)
+    im.draft("RGB", (480, 480))  # big JPEG photos load much faster
+    im = ImageOps.exif_transpose(im)
     im.thumbnail((240, 240))
     rgba = np.asarray(im.convert("RGBA"), dtype=float) / 255
     alpha = rgba[..., 3]
@@ -383,6 +387,143 @@ def load_outline(path, max_points=4000):
     return x / r * 0.8, y / r * 0.8, blank  # leaves room for bass pulse + wobble
 
 
+# --------------------------------------------------------------- picker ----
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".ico"}
+
+
+class Picker:
+    """The Tab menu: browse folders and choose an image for the beam to trace."""
+
+    def __init__(self, start, have_image):
+        self.have_image = have_image
+        self.msg = ""
+        self.dir = None
+        self.open_dir(start)
+
+    def open_dir(self, path, select_name=None):
+        try:
+            names = sorted(os.listdir(path), key=str.lower)
+        except OSError as e:
+            self.msg = "can't open %s: %s" % (os.path.basename(path) or path, e.strerror)
+            return
+        self.dir = path
+        full = [(n, os.path.join(path, n)) for n in names if not n.startswith(".")]
+        dirs = [(n, f) for n, f in full if os.path.isdir(f)]
+        imgs = [(n, f) for n, f in full
+                if os.path.splitext(n)[1].lower() in IMAGE_EXTS and os.path.isfile(f)]
+        self.entries = []
+        if self.have_image:
+            self.entries.append(("scope", None, "◉ back to the scope (no image)"))
+        if os.path.dirname(path) != path:
+            self.entries.append(("dir", os.path.dirname(path), "◂ .."))
+        self.entries += [("dir", f, n + "/") for n, f in dirs]
+        self.entries += [("image", f, n) for n, f in imgs]
+        self.sel, self.top = 0, 0
+        for i, (kind, f, _) in enumerate(self.entries):
+            if select_name and f and os.path.basename(f) == select_name:
+                self.sel = i
+        if not imgs and not dirs:
+            self.msg = "no images in this folder"
+
+    def key(self, k):
+        """Returns ("close",), ("scope",), ("pick", path) or None."""
+        n = len(self.entries)
+        if k in ("TAB", "ESC"):
+            return ("close",)
+        if k in ("UP", "k"):
+            self.sel = (self.sel - 1) % n
+        elif k in ("DOWN", "j"):
+            self.sel = (self.sel + 1) % n
+        elif k == "PGUP":
+            self.sel = max(self.sel - 10, 0)
+        elif k == "PGDN":
+            self.sel = min(self.sel + 10, n - 1)
+        elif k in ("LEFT", "BACKSPACE"):
+            self.msg = ""
+            self.open_dir(os.path.dirname(self.dir), os.path.basename(self.dir))
+        elif k in ("RIGHT", "ENTER", " "):
+            kind, path, _ = self.entries[self.sel]
+            if kind == "dir":
+                self.msg = ""
+                came_from = os.path.basename(self.dir) if path == os.path.dirname(self.dir) else None
+                self.open_dir(path, came_from)
+            elif kind == "image" and k != "RIGHT":
+                return ("pick", path)
+            elif kind == "scope" and k != "RIGHT":
+                return ("scope",)
+        return None
+
+    def draw(self, cols, rows):
+        """The menu box as escape codes, drawn on top of the tube."""
+        w = max(20, min(64, cols - 4))
+        h = max(3, min(len(self.entries), rows - 8))
+        x0 = (cols - w) // 2 + 1
+        y0 = max(1, (rows - (h + 4)) // 2 + 1)
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + h:
+            self.top = self.sel - h + 1
+        bg, border = "\x1b[48;2;8;12;10m", fg(INFO_RGB)
+        home = os.path.expanduser("~")
+        where = ("~" + self.dir[len(home):]) if self.dir.startswith(home) else self.dir
+        title = (" " + where + " ")[-(w - 4):]
+        lines = [border + "╭─" + title + "─" * (w - 3 - len(title)) + "╮"]
+        for i in range(self.top, self.top + h):
+            if i < len(self.entries):
+                kind, _, label = self.entries[i]
+                color = fg((150, 200, 255) if kind == "dir" else
+                           (255, 200, 120) if kind == "scope" else (200, 235, 205))
+                text = (" " + label)[:w - 2].ljust(w - 2)
+                if i == self.sel:
+                    text = "\x1b[7m" + text + "\x1b[27m"
+                lines.append(border + "│" + color + text + border + "│")
+            else:
+                lines.append(border + "│" + " " * (w - 2) + "│")
+        foot = self.msg or "↑↓ choose  Enter pick  ← back  Tab close"
+        lines.append(border + "│" + fg((230, 160, 120) if self.msg else INFO_RGB)
+                     + (" " + foot)[:w - 2].ljust(w - 2) + border + "│")
+        lines.append(border + "╰" + "─" * (w - 2) + "╯")
+        return "".join("\x1b[%d;%dH%s%s" % (y0 + r, x0, bg, line)
+                       for r, line in enumerate(lines)) + "\x1b[49m"
+
+
+KEY_SEQS = {"\x1b[A": "UP", "\x1b[B": "DOWN", "\x1b[C": "RIGHT", "\x1b[D": "LEFT",
+            "\x1bOA": "UP", "\x1bOB": "DOWN", "\x1bOC": "RIGHT", "\x1bOD": "LEFT",
+            "\x1b[5~": "PGUP", "\x1b[6~": "PGDN"}
+KEY_NAMES = {"\r": "ENTER", "\n": "ENTER", "\t": "TAB", "\x7f": "BACKSPACE", "\x08": "BACKSPACE"}
+
+
+def read_keys(fd):
+    """Everything typed since last frame, with arrow keys etc. as one key each
+    (they arrive as Esc + letters, which must not count as a lone Esc)."""
+    data = b""
+    while select.select([fd], [], [], 0)[0]:
+        chunk = os.read(fd, 1024)
+        if not chunk:
+            break
+        data += chunk
+    s, keys, i = data.decode(errors="ignore"), [], 0
+    while i < len(s):
+        if s[i] == "\x1b":
+            seq = next((q for q in KEY_SEQS if s.startswith(q, i)), None)
+            if seq:
+                keys.append(KEY_SEQS[seq])
+                i += len(seq)
+            elif s.startswith("\x1b[", i):  # some other special key: skip it
+                j = i + 2
+                while j < len(s) and not (s[j].isalpha() or s[j] == "~"):
+                    j += 1
+                i = j + 1
+            else:
+                keys.append("ESC")
+                i += 1
+            continue
+        keys.append(KEY_NAMES.get(s[i], s[i]))
+        i += 1
+    return keys
+
+
 # ----------------------------------------------------------------- main ----
 
 
@@ -416,6 +557,11 @@ def main():
     args = ap.parse_args()
 
     outline = None
+    image_name = os.path.basename(args.image) if args.image else None
+    browse_dir = (os.path.dirname(os.path.abspath(args.image)) if args.image else
+                  next((d for d in (os.path.expanduser("~/Pictures"), os.path.expanduser("~"))
+                        if os.path.isdir(d)), os.getcwd()))
+    picker = None
     if args.image:
         try:
             outline = load_outline(args.image)
@@ -465,9 +611,27 @@ def main():
             fps = fps * 0.9 + 0.1 / dt
 
             # keys
-            while is_tty and select.select([fd], [], [], 0)[0]:
-                k = os.read(fd, 1).decode(errors="ignore")
-                if k in ("q", "\x1b"):
+            for k in (read_keys(fd) if is_tty else []):
+                if picker:
+                    act = picker.key(k)
+                    if act:
+                        browse_dir = picker.dir
+                    if act == ("close",):
+                        picker = None
+                    elif act == ("scope",):
+                        outline = image_name = picker = None
+                        screen.last_pt = None
+                    elif act and act[0] == "pick":
+                        try:
+                            outline = load_outline(act[1])
+                            image_name = os.path.basename(act[1])
+                            picker = None
+                        except Exception as e:  # not an image, no edges...
+                            picker.msg = "can't use that one: %s" % e
+                    continue
+                if k == "TAB":
+                    picker = Picker(browse_dir, outline is not None)
+                elif k in ("q", "ESC"):
                     running = False
                 elif k == "p":
                     ph = (ph + 1) % len(PHOSPHORS)
@@ -565,15 +729,17 @@ def main():
                 buf.append("\x1b[%d;1H%s" % (r + 1, line))
             if show_info:
                 info = (" CRT-SCOPE │ %s │ %s │ %s %s%.1fx │ glow %.1fs │ beam %d │ %dkHz │ %dfps"
-                        "   p m [ ] i I + - a g o < > h q"
+                        "   Tab images  p m [ ] i I + - a g o < > h q"
                         % (PHOSPHORS[ph][0].strip(),
-                           ("IMAGE " + os.path.basename(args.image)) if outline else
+                           ("IMAGE " + image_name) if outline else
                            "GONIO" if goniometer else "XY",
                            "wobble" if outline else "gain",
                            "auto·" if auto and not outline else "",
                            gain if outline else (0.92 / peak if auto else 1) * gain,
                            tau_g, power, src.rate // 1000, fps))
                 buf.append("\x1b[%d;1H%s%s\x1b[K" % (rows, fg(INFO_RGB), info[:cols]))
+            if picker:
+                buf.append(picker.draw(cols, plot_rows))
             out.write("".join(buf))
             out.flush()
 
