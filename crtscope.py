@@ -11,7 +11,7 @@ outlines instead: the music bends the lines, bass makes it pulse, and loudness
 makes the beam burn brighter.
 
 Keys (while running):
-  p      next phosphor (P7 radar, P1 green, P12 orange, P31 green-short)
+  p / P  next / previous colour (4 real phosphors, then the 15 Apple II colours)
   m      XY mode / goniometer mode (mono shows as a vertical line)
   [ ]    shorter / longer afterglow     i / I   dimmer / brighter beam
   + / -  gain (wobble, with an image)   a       auto gain on/off
@@ -123,6 +123,31 @@ PHOSPHORS = [
     ("P12 orange",        (255, 215, 140), 0.04,  (255, 120, 15),  0.8),
     ("P31 green-short",   (215, 255, 215), 0.01,  (70, 255, 120),  0.06),
 ]
+
+# The Apple II's 16 colours, sampled from a photo of a real composite monitor
+# (Black left out: a black beam draws nothing). Brightened by the photo's
+# exposure, keeping the dark ones darker, with a whiter flash where the beam lands.
+APPLE_II = [
+    ("01 Dark Green", (10, 67, 34)), ("02 Royal Blue", (4, 50, 175)),
+    ("03 Medium Blue", (53, 159, 231)), ("04 Dark Red", (154, 25, 27)),
+    ("05 Gray", (109, 110, 93)), ("06 Purple", (164, 82, 210)),
+    ("07 Periwinkle", (132, 174, 239)), ("08 Dark YellowGreen", (54, 39, 21)),
+    ("09 Green", (40, 141, 19)), ("10 Gray", (103, 91, 78)),
+    ("11 Aquamarine", (83, 175, 162)), ("12 Red", (196, 79, 17)),
+    ("13 Yellow", (195, 149, 38)), ("14 Rose", (205, 123, 144)),
+    ("15 White", (182, 168, 186)),
+]
+
+
+def apple_phosphor(name, rgb):
+    glow = np.array(rgb) * 255 / 186  # the photo's white only reached 186
+    if glow.max() < 150:  # keep the darkest ones visible on black
+        glow *= 150 / glow.max()
+    flash = glow + (255 - glow) * 0.55
+    return ("A2 " + name, tuple(flash.clip(0, 255)), 0.02, tuple(glow.clip(0, 255)), 0.35)
+
+
+PHOSPHORS += [apple_phosphor(n, c) for n, c in APPLE_II]
 FLASH_LEVELS, GLOW_LEVELS = 8, 32
 GRAT_RGB = (52, 64, 56)
 BEZEL_RGB = (70, 70, 74)
@@ -549,7 +574,8 @@ def main():
     ap.add_argument("--demo", action="store_true", help="draw a test tone, no audio needed")
     ap.add_argument("--fps", type=int, default=60)
     ap.add_argument("--phosphor", type=int, default=1, choices=range(1, len(PHOSPHORS) + 1),
-                    help="1=P7 radar 2=P1 green 3=P12 orange 4=P31 green-short")
+                    help="1=P7 radar 2=P1 green 3=P12 orange 4=P31 green-short, "
+                         "5-19 = Apple II colours 01-15 (Dark Green ... White)")
     ap.add_argument("--aspect", type=float, default=0,
                     help="dot width/height override if the tube isn't round (e.g. 0.9)")
     ap.add_argument("--square", action="store_true", help="square screen instead of round tube")
@@ -633,8 +659,8 @@ def main():
                     picker = Picker(browse_dir, outline is not None)
                 elif k in ("q", "ESC"):
                     running = False
-                elif k == "p":
-                    ph = (ph + 1) % len(PHOSPHORS)
+                elif k in ("p", "P"):
+                    ph = (ph + (1 if k == "p" else -1)) % len(PHOSPHORS)
                     palette = build_palette(PHOSPHORS[ph])
                 elif k == "m":
                     goniometer = not goniometer
@@ -700,6 +726,8 @@ def main():
                 freqs = np.fft.rfftfreq(len(mono), 1 / src.rate)
                 bass = float(spec[(freqs > 30) & (freqs < 160)].sum())
                 loud = float(np.sqrt(np.mean(mono ** 2)))
+                if bass_avg <= 1e-6 and bass > 1e-4:  # first real sound: start from it,
+                    bass_avg, loud_avg = bass, loud      # or everything looks like a bass hit
                 bass_avg += (bass - bass_avg) * min(dt / 2.0, 1)
                 loud_avg += (loud - loud_avg) * min(dt / 2.0, 1)
                 kick = min(max(bass / (bass_avg + 1e-9) - 1, 0), 1.5) if bass > 1e-4 else 0

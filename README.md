@@ -44,6 +44,16 @@ into a lot of little squiggles. Transparent PNGs use their shape's edge.
 | 3 | P12 orange | orange radar glow |
 | 4 | P31 green-short | crisp green, almost no trail |
 
+### Apple II colours (5–19)
+
+The Apple II's composite colours, sampled from a photo of a real monitor, as
+extra beam colours: 01 Dark Green, 02 Royal Blue, 03 Medium Blue, 04 Dark Red,
+05 Gray, 06 Purple, 07 Periwinkle, 08 Dark YellowGreen, 09 Green, 10 Gray,
+11 Aquamarine, 12 Red, 13 Yellow, 14 Rose, 15 White. `--phosphor 5` is 01 Dark
+Green, up to `--phosphor 19` for 15 White.
+
+![The 15 Apple II colours](screenshots/apple2.png)
+
 ## Run it
 
 Needs Python 3, numpy, and `parec` (PulseAudio or PipeWire) to hear what your
@@ -55,6 +65,7 @@ python3 crtscope.py --demo        # 3:2 test tone, no audio needed
 python3 crtscope.py cat.png       # trace an image instead
 python3 crtscope.py --mic         # listen to the microphone instead
 python3 crtscope.py --phosphor 2 --square --fps 144
+python3 crtscope.py --phosphor 10       # Apple II 06 Purple
 ```
 
 Simple tones, synth pads and "oscilloscope music" look best. Busy mixes turn
@@ -65,7 +76,7 @@ into a glowing ball of noise, as they would on a real scope.
 | Key | Does |
 | --- | --- |
 | Tab | browse ~/Pictures and pick an image to trace (↑↓ Enter, ← back, Tab/Esc close) |
-| `p` | next phosphor |
+| `p` / `P` | next / previous colour |
 | `m` | XY / goniometer (mono shows as a vertical line) |
 | `[` / `]` | shorter / longer afterglow |
 | `i` / `I` | dimmer / brighter beam |
