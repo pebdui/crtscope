@@ -33,6 +33,53 @@ Logos, line art, icons and high-contrast pictures work best; busy photos turn
 into a lot of little squiggles. Transparent PNGs use their shape's edge.
 `+` / `-` set how strongly the music bends the lines.
 
+## Bad Apple mode: play a GIF or video
+
+Give it a GIF or a video and the beam traces every frame's outlines as it plays,
+the way people play "Bad Apple!!" on real oscilloscopes. Black-and-white
+silhouettes work best; busy cartoons turn into a tangle of lines.
+
+<p align="center">
+  <img src="screenshots/videos.png" width="100%" alt="Bad Apple, Neco-Arc and a dancing cat traced by the beam">
+</p>
+
+```sh
+python3 crtscope.py bad-apple.gif
+python3 crtscope.py music-video.mp4     # plays its soundtrack too; --mute to skip it
+```
+
+Or press **Tab** and pick one; videos are marked with ▶. Frames are traced on all
+your CPU cores while it plays, so it starts within about a second. A video's own
+soundtrack plays along, so its music bends its own picture. While a video plays
+the afterglow is kept short, otherwise the frames would smear together.
+
+Videos need `ffmpeg`; GIFs don't.
+
+## Waveform and clock
+
+<p align="center">
+  <img src="screenshots/modes.png" width="80%" alt="The clock mode and the waveform mode">
+</p>
+
+Press `m` to step through the modes: **XY** (Lissajous), **goniometer**,
+**waveform** and **clock**.
+
+- **Waveform** is a scope's classic view: the sound wave sweeping left to right.
+  It's triggered like a real scope, so repeating sounds stand still instead of
+  rolling. `t` / `T` speed up / slow down the sweep.
+- **Clock** writes the time and date in a single-stroke vector font, like the
+  old DIY oscilloscope clocks, plus the song that's playing in Spotify, your
+  browser or any player that reports it to the desktop. Long titles show a page
+  at a time.
+
+## The tube
+
+It powers on like an old tube (a dot opens into a line, then the picture) and
+collapses to a line and a fading dot when you quit; press any key to skip that,
+or start with `--no-power`. `f` cycles tube flaws: **subtle** (the default)
+adds a faint 60Hz mains hum to the beam, slightly soft focus toward the rim
+and a little flicker; **worn** makes them obvious; **off** is a perfect tube.
+
 ## Phosphors
 
 ![The four phosphors side by side](screenshots/phosphors.png)
@@ -64,6 +111,8 @@ python3 crtscope.py               # listen to system audio at 192kHz
 python3 crtscope.py --demo        # 3:2 test tone, no audio needed
 python3 crtscope.py cat.png       # trace an image instead
 python3 crtscope.py --mic         # listen to the microphone instead
+python3 crtscope.py --mode clock  # start as a clock (also: xy, gonio, wave)
+python3 crtscope.py --flaws worn  # an old, tired tube (also: off, subtle)
 python3 crtscope.py --phosphor 2 --square --fps 144
 python3 crtscope.py --phosphor 10       # Apple II 06 Purple
 ```
@@ -75,9 +124,11 @@ into a glowing ball of noise, as they would on a real scope.
 
 | Key | Does |
 | --- | --- |
-| Tab | browse ~/Pictures and pick an image to trace (↑↓ Enter, ← back, Tab/Esc close) |
+| Tab | browse ~/Pictures and pick an image, GIF or video (↑↓ Enter, ← back, Tab/Esc close) |
 | `p` / `P` | next / previous colour |
-| `m` | XY / goniometer (mono shows as a vertical line) |
+| `m` | mode: XY / goniometer (mono shows as a vertical line) / waveform / clock |
+| `t` / `T` | waveform: faster / slower sweep |
+| `f` | tube flaws: off / subtle / worn |
 | `[` / `]` | shorter / longer afterglow |
 | `i` / `I` | dimmer / brighter beam |
 | `+` / `-` | gain (how much the music bends the lines, with an image) |
@@ -86,4 +137,4 @@ into a glowing ball of noise, as they would on a real scope.
 | `o` | round tube / square screen |
 | `<` / `>` | squash / stretch sideways (only needed if your terminal hides its cell size) |
 | `h` | hide the info bar |
-| `q` / Esc | quit |
+| `q` / Esc | switch off and quit (any key skips the power-off) |

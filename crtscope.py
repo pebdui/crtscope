@@ -8,20 +8,24 @@ fades over time, and it glows brighter where it moves slowly.
 Give it an image (crtscope picture.png, or press Tab to pick one from
 ~/Pictures) and the beam traces the picture's
 outlines instead: the music bends the lines, bass makes it pulse, and loudness
-makes the beam burn brighter.
+makes the beam burn brighter. Give it a GIF or video and it plays every frame
+that way ("Bad Apple" mode), with the video's own soundtrack.
 
 Keys (while running):
+  m      mode: XY / goniometer / waveform / clock
   p / P  next / previous colour (4 real phosphors, then the 15 Apple II colours)
-  m      XY mode / goniometer mode (mono shows as a vertical line)
   [ ]    shorter / longer afterglow     i / I   dimmer / brighter beam
   + / -  gain (wobble, with an image)   a       auto gain on/off
+  t / T  waveform: faster / slower sweep
+  f      tube flaws: off / subtle / worn (hum, soft edges, flicker)
   g      graticule on/off               o       round tube / square screen
   < >    squash / stretch sideways, if your terminal makes the tube oval
-  Tab    browse your pictures and pick one to trace (or go back to the scope)
-  h      hide the info bar              q / Esc quit
+  Tab    browse your pictures and videos and pick one (or go back to the scope)
+  h      hide the info bar              q / Esc switch off and quit
 """
 
 import argparse
+import bisect
 import fcntl
 import math
 import os
@@ -200,6 +204,9 @@ class Screen:
         self.flash = np.zeros((self.H, self.W))
         self.glow = np.zeros((self.H, self.W))
         self.last_pt = None
+        self.sx = self.sy = 1.0   # picture size while the tube powers on / off
+        self.flaws = 1            # 0 off, 1 subtle, 2 worn (see FLAWS)
+        self.hum_t = 0.0
 
         yy, xx = np.mgrid[0:self.H, 0:self.W]
         u = (xx + 0.5 - self.cx) * aspect / self.R
@@ -212,6 +219,7 @@ class Screen:
             self.face = (np.abs(u) <= 1.0) & (np.abs(v) <= 1.0)
             edge = np.maximum(np.abs(u), np.abs(v)) * self.R
             self.bezel = np.abs(edge - (self.R + 2.5)) < 0.7
+        self.rr = np.clip(rr, 0, 1)
         # Tubes are dimmer toward the rim
         self.vignette = np.clip(1 - 0.45 * rr ** 4, 0.3, 1)
 
@@ -247,6 +255,17 @@ class Screen:
             return
         if blank is None:
             blank = np.zeros(len(px), bool)
+        px, py = np.asarray(px, float), np.asarray(py, float)
+        if self.flaws:
+            # an old tube's amplifiers pick up the 60Hz mains hum (a fine ripple
+            # up and down) and drift a little sideways as they warm
+            t = self.hum_t + np.arange(len(px)) / rate
+            self.hum_t = (self.hum_t + len(px) / rate) % 100
+            a = (0.0035, 0.009)[self.flaws - 1] * self.R
+            py = py + a * np.sin(2 * np.pi * 60 * t)
+            px = px + 0.6 * a * np.sin(2 * np.pi * 0.23 * t + 1.3) / self.aspect
+        px = self.cx + (px - self.cx) * self.sx
+        py = self.cy + (py - self.cy) * self.sy
         if self.last_pt is not None:  # carry on from where the last frame ended
             px = np.concatenate([[self.last_pt[0]], px])
             py = np.concatenate([[self.last_pt[1]], py])
@@ -277,6 +296,16 @@ class Screen:
     def render(self, palette, show_grat):
         f = (1 - np.exp(-self.flash)) * self.vignette * self.face
         g = (1 - np.exp(-self.glow)) * self.vignette * self.face
+        if self.flaws:
+            # the beam goes out of focus toward the rim, and the picture flickers
+            k = (0.35, 0.8)[self.flaws - 1] * self.rr ** 2
+
+            def soft(a):
+                return (a + np.roll(a, 1, 0) + np.roll(a, -1, 0) + np.roll(a, 1, 1) + np.roll(a, -1, 1)) / 5
+            f = f + (soft(f) - f) * k
+            g = g + (soft(g) - g) * k
+            flick = 1 + (0.025, 0.07)[self.flaws - 1] * (np.random.random() * 2 - 1)
+            f, g = f * flick, g * flick
         lit = (f + g) > 0.05
         extra = (self.grat if show_grat else False) | self.bezel
 
@@ -319,7 +348,14 @@ def load_outline(path, max_points=4000):
     im.draft("RGB", (480, 480))  # big JPEG photos load much faster
     im = ImageOps.exif_transpose(im)
     im.thumbnail((240, 240))
-    rgba = np.asarray(im.convert("RGBA"), dtype=float) / 255
+    return outline_from_rgba(np.asarray(im.convert("RGBA")), max_points)
+
+
+def outline_from_rgba(rgba, max_points=4000, whole_frame=False):
+    """The tracing itself, on an RGBA pixel array (uint8). whole_frame=True
+    (video) fits the whole frame in the tube instead of just the shapes, so
+    things don't jump around as the picture changes between frames."""
+    rgba = rgba.astype(float) / 255
     alpha = rgba[..., 3]
     lum = rgba[..., :3] @ np.array([0.299, 0.587, 0.114]) * alpha
 
@@ -348,7 +384,9 @@ def load_outline(path, max_points=4000):
         fwd = m[1 + dy:1 + dy + h, 1 + dx:1 + dx + w]
         back = m[1 - dy:1 - dy + h, 1 - dx:1 - dx + w]
         crest |= (ang == a) & (mag >= fwd) & (mag >= back)
-    strong = mag > max(0.25 * np.percentile(mag[mag > 0], 99) if (mag > 0).any() else 1, 0.05)
+    rel = 0.1 if whole_frame else 0.25  # video: keep softer, motion-blurred edges too
+    strong = mag > max(rel * np.percentile(mag[mag > 0], 99) if (mag > 0).any() else 1,
+                       0.1 if whole_frame else 0.05)
     ys, xs = np.nonzero(crest & strong)
     if len(xs) < 2:
         raise ValueError("couldn't find any outlines in that image")
@@ -406,15 +444,432 @@ def load_outline(path, max_points=4000):
 
     x = xs[order].astype(float)
     y = -ys[order].astype(float)
+    if whole_frame:
+        x -= (w - 1) / 2
+        y += (h - 1) / 2
+        r = math.hypot(w, h) / 2 / 1.05  # frame corners just past the rim
+        return x / r * 0.8, y / r * 0.8, blank
     x -= (x.max() + x.min()) / 2
     y -= (y.max() + y.min()) / 2
     r = np.hypot(x, y).max() or 1
     return x / r * 0.8, y / r * 0.8, blank  # leaves room for bass pulse + wobble
 
 
+# ---------------------------------------------------------------- video ----
+# "Bad Apple" mode: play a GIF or video by tracing every frame's outlines.
+
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".gif"}
+
+
+def is_video(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext != ".gif":
+        return ext in VIDEO_EXTS
+    try:  # a GIF with one frame is just a picture
+        from PIL import Image
+        return getattr(Image.open(path), "n_frames", 1) > 1
+    except Exception:
+        return False
+
+
+def _trace_frame(rgba):
+    """Worker-process job: one frame -> beam path (None if the frame is blank)."""
+    try:
+        x, y, blank = outline_from_rgba(rgba, max_points=2500, whole_frame=True)
+    except ValueError:
+        return None
+    return x.astype(np.float32), y.astype(np.float32), blank
+
+
+class Video:
+    """Decodes frames in the background, traces them on all CPU cores (way
+    faster than the video plays), and plays them back on the video's own clock.
+    The video's soundtrack is played too, so the music bends its own picture."""
+
+    def __init__(self, path, sound=True):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.frames, self.starts = [], []   # traced frames and when each one starts
+        self.total = 0                      # expected frame count, for the loading %
+        self.duration = 0.0
+        self.done = False
+        self.error = None
+        self.t = 0.0
+        self.playing = False
+        self.stalled = False
+        self.closed = False
+        self.sound = sound and self._has_audio()
+        self.sound_proc = None
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _has_audio(self):
+        if self.path.lower().endswith(".gif"):
+            return False
+        try:
+            out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                                  "-show_entries", "stream=index", "-of", "csv=p=0", self.path],
+                                 capture_output=True, text=True, timeout=10).stdout
+            return bool(out.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _decode(self):
+        """Yields (rgba uint8 array, seconds on screen) for every frame."""
+        if self.path.lower().endswith(".gif"):
+            from PIL import Image, ImageSequence
+            im = Image.open(self.path)
+            self.total = getattr(im, "n_frames", 1)
+            for frame in ImageSequence.Iterator(im):
+                f = frame.convert("RGBA")
+                f.thumbnail((240, 240))
+                yield np.asarray(f), max(frame.info.get("duration", 100) or 100, 20) / 1000
+            return
+        fps = 24
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                "format=duration", "-of", "csv=p=0", self.path],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+        try:
+            self.total = int(float(probe) * fps)
+        except ValueError:
+            pass
+        # scale so the long side is 240, keeping both sides even
+        vf = f"fps={fps},scale='if(gt(iw,ih),240,-2)':'if(gt(iw,ih),-2,240)'"
+        size = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                               "stream=width,height", "-of", "csv=p=0", self.path],
+                              capture_output=True, text=True, timeout=10).stdout.strip().split(",")
+        w0, h0 = int(size[0]), int(size[1])
+        w, h = (240, int(round(240 * h0 / w0 / 2)) * 2) if w0 > h0 else (int(round(240 * w0 / h0 / 2)) * 2, 240)
+        proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", self.path, "-vf", vf,
+                                 "-f", "rawvideo", "-pix_fmt", "rgba", "-"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while not self.closed:
+                data = proc.stdout.read(w * h * 4)
+                if len(data) < w * h * 4:
+                    break
+                yield np.frombuffer(data, np.uint8).reshape(h, w, 4), 1 / fps
+        finally:
+            proc.kill()
+
+    def _load(self):
+        import multiprocessing
+        try:
+            durations = []
+
+            def frames():
+                for rgba, d in self._decode():
+                    if self.closed:
+                        return
+                    durations.append(d)
+                    yield rgba
+
+            ctx = multiprocessing.get_context("forkserver")
+            with ctx.Pool(max(1, (os.cpu_count() or 2) - 2)) as pool:
+                t = 0.0
+                for i, path in enumerate(pool.imap(_trace_frame, frames(), chunksize=4)):
+                    if self.closed:
+                        break
+                    self.starts.append(t)
+                    self.frames.append(path)
+                    t += durations[i]
+                    self.duration = t
+        except Exception as e:  # can't decode it, ffmpeg missing, ...
+            self.error = str(e) or type(e).__name__
+        self.done = True
+
+    def progress(self):
+        return len(self.frames) / self.total if self.total else 0.0
+
+    def _sound(self, sig):
+        if self.sound_proc and self.sound_proc.poll() is None:
+            try:
+                self.sound_proc.send_signal(sig)
+            except OSError:
+                pass
+
+    def _start_sound(self):
+        self.stop_sound()
+        if self.sound:
+            try:
+                self.sound_proc = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", self.path],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                self.sound = False
+
+    def stop_sound(self):
+        if self.sound_proc:
+            self.sound_proc.kill()
+            self.sound_proc = None
+
+    def frame(self, dt):
+        """Advance the clock by dt and return the frame to show: a path, None for
+        a blank frame, or "loading" while there's not enough traced to start."""
+        if not self.playing:
+            # start once a second is traced (or all of it, for short clips)
+            if self.frames and (self.done or self.duration >= 1.0):
+                self.playing, self.t = True, 0.0
+                self._start_sound()
+            else:
+                return "loading"
+        t = self.t + dt
+        if self.done and t >= self.duration:  # loop
+            t = 0.0
+            self._start_sound()
+        i = bisect.bisect_right(self.starts, t) - 1
+        if i >= len(self.frames) - 1 and not self.done:
+            # tracing fell behind (rare): hold this frame and pause the sound
+            if not self.stalled:
+                self._sound(signal.SIGSTOP)
+                self.stalled = True
+        else:
+            if self.stalled:
+                self._sound(signal.SIGCONT)
+                self.stalled = False
+            self.t = t
+        i = max(0, min(bisect.bisect_right(self.starts, self.t) - 1, len(self.frames) - 1))
+        return self.frames[i]
+
+    def close(self):
+        self.closed = True
+        self.stop_sound()
+
+
+# ----------------------------------------------------------------- text ----
+# A single-stroke vector font, like the ones real scope clocks draw: each
+# glyph is a few lines on a 4-wide, 6-tall grid (y up).
+
+_G = {
+    "0": "0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0 0,1|1,1 3,5",
+    "1": "1,5 2,6 2,0|1,0 3,0",
+    "2": "0,5 1,6 3,6 4,5 4,4 0,0 4,0",
+    "3": "0,5 1,6 3,6 4,5 4,4 3,3 4,2 4,1 3,0 1,0 0,1|1,3 3,3",
+    "4": "3,0 3,6 0,2 4,2",
+    "5": "4,6 0,6 0,3 3,3 4,2 4,1 3,0 0,0",
+    "6": "4,5 3,6 1,6 0,5 0,1 1,0 3,0 4,1 4,2 3,3 0,3",
+    "7": "0,6 4,6 1,0",
+    "8": "1,3 0,4 0,5 1,6 3,6 4,5 4,4 3,3 1,3 0,2 0,1 1,0 3,0 4,1 4,2 3,3",
+    "9": "0,1 1,0 3,0 4,1 4,5 3,6 1,6 0,5 0,4 1,3 4,3",
+    "A": "0,0 0,4 2,6 4,4 4,0|0,3 4,3",
+    "B": "0,0 0,6 3,6 4,5 4,4 3,3 0,3|3,3 4,2 4,1 3,0 0,0",
+    "C": "4,5 3,6 1,6 0,5 0,1 1,0 3,0 4,1",
+    "D": "0,0 0,6 2,6 4,4 4,2 2,0 0,0",
+    "E": "4,6 0,6 0,0 4,0|0,3 3,3",
+    "F": "4,6 0,6 0,0|0,3 3,3",
+    "G": "4,5 3,6 1,6 0,5 0,1 1,0 3,0 4,1 4,3 2,3",
+    "H": "0,0 0,6|4,0 4,6|0,3 4,3",
+    "I": "1,6 3,6|2,6 2,0|1,0 3,0",
+    "J": "4,6 4,1 3,0 1,0 0,1",
+    "K": "0,0 0,6|4,6 0,2|1,3 4,0",
+    "L": "0,6 0,0 4,0",
+    "M": "0,0 0,6 2,3 4,6 4,0",
+    "N": "0,0 0,6 4,0 4,6",
+    "O": "1,0 0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0",
+    "P": "0,0 0,6 3,6 4,5 4,4 3,3 0,3",
+    "Q": "1,0 0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0|2,2 4,0",
+    "R": "0,0 0,6 3,6 4,5 4,4 3,3 0,3|2,3 4,0",
+    "S": "4,5 3,6 1,6 0,5 0,4 1,3 3,3 4,2 4,1 3,0 1,0 0,1",
+    "T": "0,6 4,6|2,6 2,0",
+    "U": "0,6 0,1 1,0 3,0 4,1 4,6",
+    "V": "0,6 2,0 4,6",
+    "W": "0,6 1,0 2,3 3,0 4,6",
+    "X": "0,0 4,6|0,6 4,0",
+    "Y": "0,6 2,3 4,6|2,3 2,0",
+    "Z": "0,6 4,6 0,0 4,0",
+    ":": "2,1 2,1.7|2,4.3 2,5",
+    "-": "1,3 3,3",
+    ".": "2,0 2,0.6",
+    ",": "2,0.6 1.4,-0.6",
+    "'": "2,6 2,4.8",
+    "!": "2,6 2,2|2,0 2,0.6",
+    "?": "0,5 1,6 3,6 4,5 4,4 2,3 2,2|2,0 2,0.6",
+    "&": "4,0 1,4 1,5 2,6 3,5 0,1 1,0 2,0 4,2",
+    "(": "3,6 2,4 2,2 3,0",
+    ")": "1,6 2,4 2,2 1,0",
+    "/": "0,0 4,6",
+    "+": "2,1 2,5|0,3 4,3",
+    "%": "0,0 4,6|0.5,5 0.5,5.6|3.5,0.4 3.5,1",
+    "#": "1,0 1,6|3,0 3,6|0,2 4,2|0,4 4,4",
+}
+GLYPHS = {ch: [np.array([[float(v) for v in p.split(",")] for p in stroke.split()])
+               for stroke in spec.split("|")] for ch, spec in _G.items()}
+ADVANCE = 6.0  # glyph width 4 + gap 2
+
+
+def _ascii(text):
+    import unicodedata
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return "".join(c if c.upper() in GLYPHS else " " for c in text).upper()
+
+
+def text_width(text, height):
+    return max(len(_ascii(text)) * ADVANCE - 2, 0) * height / 6
+
+
+def text_path(text, height, cx=0.0, cy=0.0, spacing=0.006):
+    """Beam path that writes text centred on (cx, cy), in tube-radius units.
+    Points are spread evenly along the strokes so every line burns equally."""
+    text = _ascii(text)
+    k = height / 6
+    x0 = cx - text_width(text, height) / 2
+    xs, ys, blank = [], [], []
+    for i, ch in enumerate(text):
+        for stroke in GLYPHS.get(ch, []):
+            pts = stroke * k + [x0 + i * ADVANCE * k, cy - height / 2]
+            seg = np.hypot(*np.diff(pts, axis=0).T)
+            n = np.maximum(np.ceil(seg / spacing).astype(int), 1)
+            for (a, b), m in zip(zip(pts[:-1], pts[1:]), n):
+                t = np.arange(m)[:, None] / m
+                p = a + (b - a) * t
+                xs.append(p[:, 0]); ys.append(p[:, 1])
+                blank.append(np.zeros(m, bool))
+            xs.append(pts[-1:, 0]); ys.append(pts[-1:, 1]); blank.append(np.zeros(1, bool))
+            blank[-1 - (len(n))][0] = True  # beam off while jumping to this stroke
+    if not xs:
+        return np.zeros(0), np.zeros(0), np.zeros(0, bool)
+    return np.concatenate(xs), np.concatenate(ys), np.concatenate(blank)
+
+
+def join_paths(*paths):
+    paths = [p for p in paths if p is not None and len(p[0])]
+    if not paths:
+        return None
+    x = np.concatenate([p[0] for p in paths])
+    y = np.concatenate([p[1] for p in paths])
+    b = np.concatenate([p[2] for p in paths])
+    return x, y, b
+
+
+class NowPlaying:
+    """The song title from any media player that reports it to the desktop
+    (Spotify, browsers, mpv... over MPRIS), checked every 2 seconds."""
+
+    def __init__(self):
+        self.text = ""
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            import gi
+            from gi.repository import Gio, GLib
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except Exception:
+            return  # no D-Bus / PyGObject: just no title
+
+        def get(name, prop):
+            r = bus.call_sync(name, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties",
+                              "Get", GLib.Variant("(ss)", ("org.mpris.MediaPlayer2.Player", prop)),
+                              GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 500, None)
+            return r.unpack()[0]
+
+        while True:
+            try:
+                names = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                      "org.freedesktop.DBus", "ListNames", None,
+                                      GLib.VariantType("(as)"), Gio.DBusCallFlags.NONE, 500,
+                                      None).unpack()[0]
+                best = ""
+                for name in (n for n in names if n.startswith("org.mpris.MediaPlayer2.")):
+                    try:
+                        meta = get(name, "Metadata")
+                        status = get(name, "PlaybackStatus")
+                    except Exception:
+                        continue
+                    title = meta.get("xesam:title", "")
+                    artist = ", ".join(meta.get("xesam:artist", []) or [])
+                    line = f"{artist} - {title}" if artist and title else title
+                    if line and (status == "Playing" or not best):
+                        best = line
+                        if status == "Playing":
+                            break
+                self.text = best
+            except Exception:
+                self.text = ""
+            time.sleep(2)
+
+
+def clock_path(now_playing, elapsed):
+    """Time in big strokes, the date above, and what's playing below. A title
+    too long to fit is shown a page at a time (scrolling text would smear in
+    the phosphor's afterglow)."""
+    lt = time.localtime()
+    parts = [text_path(time.strftime("%H:%M:%S", lt), 0.2),
+             text_path(time.strftime("%a %d %b %Y", lt), 0.09, cy=0.36)]
+    song = now_playing.text if now_playing else ""
+    if song:
+        h, room = 0.09, 1.45
+        pages, line = [], ""
+        for word in _ascii(song).split():
+            while text_width(word, h) > room:  # a single huge word: chop it
+                cut = int(room / (ADVANCE * h / 6))
+                if line:
+                    pages.append(line)
+                    line = ""
+                pages.append(word[:cut])
+                word = word[cut:]
+            if line and text_width(line + " " + word, h) > room:
+                pages.append(line)
+                line = word
+            else:
+                line = (line + " " + word).strip()
+        if line:
+            pages.append(line)
+        if pages:
+            parts.append(text_path(pages[int(elapsed / 3) % len(pages)], h, cy=-0.38))
+    return join_paths(*parts)
+
+
+def trigger(sig, win, prev=None):
+    """Scope trigger: start the window where the wave last rose through half
+    its height (leaving a full window after it), so repeating waves stand
+    still. Half height, not zero: busy waves cross zero several times per
+    cycle, which would make copies of the wave pile up."""
+    if len(sig) <= win + 2:
+        return sig[-win:]
+    k = 24  # smooth a little so noise doesn't trigger it
+    sm = np.convolve(sig, np.ones(k) / k, mode="same")
+    level = 0.5 * float(sm.max())
+    cand = np.flatnonzero((sm[:-1] < level) & (sm[1:] >= level)) + 1
+    cand = cand[cand <= len(sig) - win]
+    if not len(cand):
+        return sig[-win:]
+    if prev is not None and len(prev) == win and len(cand) > 1:
+        # several places look like a trigger point: take the one whose wave
+        # best matches what's on screen, so the picture holds still
+        cand = cand[-24:]
+        step = max(1, win // 400)
+        ref = prev[::step]
+        err = [float(np.mean((sig[c:c + win:step] - ref) ** 2)) for c in cand]
+        start = cand[int(np.argmin(err))]
+    else:
+        start = cand[-1]
+    return sig[start:start + win]
+
+
+def power_curve(on_t, off_t):
+    """Horizontal size, vertical size and beam strength while the tube switches
+    on (a dot that opens into a line, then the full picture) or off (the
+    picture collapses to a line, then to a dot that slowly fades)."""
+    def ease(a):
+        a = min(max(a, 0.0), 1.0)
+        return a * a * (3 - 2 * a)
+    if off_t is not None:
+        sy = 1 - ease(off_t / 0.18)
+        sx = 1 - ease((off_t - 0.18) / 0.22)
+        fade = 1.0 if off_t < 0.45 else math.exp(-(off_t - 0.45) / 0.35)
+        return max(sx, 0.0), max(sy, 0.004), fade
+    if on_t >= 0.9:
+        return 1.0, 1.0, 1.0
+    sx = ease((on_t - 0.15) / 0.3)
+    sy = max(ease((on_t - 0.45) / 0.4), 0.004)
+    return sx, sy, min(1.0, 0.3 + on_t * 2)
+
+
+FLAWS = ["off", "subtle", "worn"]
+
 # --------------------------------------------------------------- picker ----
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".ico"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".ico"} | VIDEO_EXTS
 
 
 class Picker:
@@ -439,11 +894,12 @@ class Picker:
                 if os.path.splitext(n)[1].lower() in IMAGE_EXTS and os.path.isfile(f)]
         self.entries = []
         if self.have_image:
-            self.entries.append(("scope", None, "◉ back to the scope (no image)"))
+            self.entries.append(("scope", None, "◉ back to the scope (no image or video)"))
         if os.path.dirname(path) != path:
             self.entries.append(("dir", os.path.dirname(path), "◂ .."))
         self.entries += [("dir", f, n + "/") for n, f in dirs]
-        self.entries += [("image", f, n) for n, f in imgs]
+        self.entries += [("image", f, ("▶ " if os.path.splitext(n)[1].lower() in VIDEO_EXTS - {".gif"}
+                                       else "") + n) for n, f in imgs]
         self.sel, self.top = 0, 0
         for i, (kind, f, _) in enumerate(self.entries):
             if select_name and f and os.path.basename(f) == select_name:
@@ -565,17 +1021,28 @@ def measure_aspect():
     return 1.0  # terminal won't say; assume 1:2 cells (fix with --aspect or < >)
 
 
+MODES = ["xy", "gonio", "wave", "clock"]
+MODE_NAMES = {"xy": "XY", "gonio": "GONIO", "wave": "WAVE", "clock": "CLOCK"}
+
+
 def main():
     ap = argparse.ArgumentParser(description="1960s military CRT audio scope for the terminal")
-    ap.add_argument("image", nargs="?", help="image for the beam to trace (png, jpg, ...)")
+    ap.add_argument("image", nargs="?",
+                    help="image to trace (png, jpg, ...) or a GIF / video to play as outlines")
     ap.add_argument("--rate", type=int, default=192000,
                     help="capture sample rate (default 192000)")
     ap.add_argument("--mic", action="store_true", help="use the microphone instead")
     ap.add_argument("--demo", action="store_true", help="draw a test tone, no audio needed")
     ap.add_argument("--fps", type=int, default=60)
+    ap.add_argument("--mode", choices=MODES, default="xy",
+                    help="xy (Lissajous), gonio, wave (classic waveform) or clock")
     ap.add_argument("--phosphor", type=int, default=1, choices=range(1, len(PHOSPHORS) + 1),
                     help="1=P7 radar 2=P1 green 3=P12 orange 4=P31 green-short, "
                          "5-19 = Apple II colours 01-15 (Dark Green ... White)")
+    ap.add_argument("--flaws", choices=FLAWS, default="subtle",
+                    help="tube imperfections: hum, soft edges, flicker (default subtle)")
+    ap.add_argument("--mute", action="store_true", help="don't play a video's own soundtrack")
+    ap.add_argument("--no-power", action="store_true", help="skip the power on / off effect")
     ap.add_argument("--aspect", type=float, default=0,
                     help="dot width/height override if the tube isn't round (e.g. 0.9)")
     ap.add_argument("--square", action="store_true", help="square screen instead of round tube")
@@ -583,20 +1050,29 @@ def main():
     args = ap.parse_args()
 
     outline = None
+    video = None
     image_name = os.path.basename(args.image) if args.image else None
     browse_dir = (os.path.dirname(os.path.abspath(args.image)) if args.image else
                   next((d for d in (os.path.expanduser("~/Pictures"), os.path.expanduser("~"))
                         if os.path.isdir(d)), os.getcwd()))
     picker = None
     if args.image:
-        try:
-            outline = load_outline(args.image)
-        except Exception as e:  # unreadable file, not an image, no edges...
-            sys.exit(f"crtscope: {args.image}: {e}")
+        if not os.path.isfile(args.image):
+            sys.exit(f"crtscope: {args.image}: no such file")
+        if is_video(args.image):
+            video = Video(args.image, sound=not args.mute)
+        else:
+            try:
+                outline = load_outline(args.image)
+            except Exception as e:  # unreadable file, not an image, no edges...
+                sys.exit(f"crtscope: {args.image}: {e}")
     src = Demo(args.rate) if args.demo else Audio(args.rate, args.mic)
+    now_playing = NowPlaying()
     ph = args.phosphor - 1
     palette = build_palette(PHOSPHORS[ph])
-    goniometer = False
+    mode = args.mode
+    flaws = FLAWS.index(args.flaws)
+    timebase = 0.02   # seconds across the screen in wave mode
     persist = 1.0
     power = 900.0
     gain = 1.0
@@ -608,6 +1084,11 @@ def main():
     peak = 0.05
     bass_avg = loud_avg = 1e-6
     bass_env = 0.0
+    on_t = 0.0 if not args.no_power else 10.0
+    off_t = None      # seconds since you pressed quit (the picture collapses)
+    scroll = 0.0
+    last_wave = None  # the wave on screen, so the trigger can hold it still
+    wave_buf = np.zeros(0, np.float32)  # recent sound, so the trigger has room to search
 
     fd = sys.stdin.fileno()
     is_tty = os.isatty(fd)
@@ -620,6 +1101,12 @@ def main():
     def stop(*_):
         nonlocal running
         running = False
+
+    def drop_media():
+        nonlocal outline, video, image_name
+        if video:
+            video.close()
+        outline = video = image_name = None
 
     signal.signal(signal.SIGTERM, stop)
     try:
@@ -635,9 +1122,14 @@ def main():
             dt = max(now - last, 1e-4)
             last = now
             fps = fps * 0.9 + 0.1 / dt
+            on_t += dt
+            scroll += dt
 
             # keys
             for k in (read_keys(fd) if is_tty else []):
+                if off_t is not None:  # a key while it's switching off: just go
+                    running = False
+                    break
                 if picker:
                     act = picker.key(k)
                     if act:
@@ -645,25 +1137,44 @@ def main():
                     if act == ("close",):
                         picker = None
                     elif act == ("scope",):
-                        outline = image_name = picker = None
+                        drop_media()
+                        picker = None
                         screen.last_pt = None
                     elif act and act[0] == "pick":
                         try:
-                            outline = load_outline(act[1])
+                            if is_video(act[1]):
+                                drop_media()
+                                video = Video(act[1], sound=not args.mute)
+                            else:
+                                new = load_outline(act[1])
+                                drop_media()
+                                outline = new
                             image_name = os.path.basename(act[1])
                             picker = None
                         except Exception as e:  # not an image, no edges...
                             picker.msg = "can't use that one: %s" % e
                     continue
                 if k == "TAB":
-                    picker = Picker(browse_dir, outline is not None)
+                    picker = Picker(browse_dir, outline is not None or video is not None)
                 elif k in ("q", "ESC"):
-                    running = False
+                    if args.no_power:
+                        running = False
+                    else:
+                        off_t = 0.0
+                        if video:
+                            video.stop_sound()
                 elif k in ("p", "P"):
                     ph = (ph + (1 if k == "p" else -1)) % len(PHOSPHORS)
                     palette = build_palette(PHOSPHORS[ph])
                 elif k == "m":
-                    goniometer = not goniometer
+                    mode = MODES[(MODES.index(mode) + 1) % len(MODES)]
+                    screen.last_pt = None
+                elif k == "t":
+                    timebase = max(timebase / 1.5, 0.001)
+                elif k == "T":
+                    timebase = min(timebase * 1.5, 0.2)
+                elif k == "f":
+                    flaws = (flaws + 1) % len(FLAWS)
                 elif k == "]":
                     persist = min(persist * 1.4, 20)
                 elif k == "[":
@@ -692,6 +1203,10 @@ def main():
                 elif k == "h":
                     show_info = not show_info
                     size = None
+            if off_t is not None:
+                off_t += dt
+                if off_t > 1.6:
+                    break
 
             cols, rows = shutil.get_terminal_size((100, 30))
             plot_rows = rows - 1 if show_info else rows
@@ -700,12 +1215,18 @@ def main():
                 aspect = (args.aspect or measure_aspect()) * nudge
                 screen = Screen(cols, plot_rows, round_tube, aspect)
                 out.write("\x1b[2J")
+            screen.flaws = flaws
+            screen.sx, screen.sy, beam = power_curve(on_t, off_t)
 
             _, _, tau_f, _, tau_g = PHOSPHORS[ph]
             tau_g *= persist
+            if video and video.playing:
+                tau_g = min(tau_g, 0.12)  # long afterglow would smear the frames together
+            elif mode == "clock" and outline is None and video is None:
+                tau_g = min(tau_g, 0.35)  # keep the ticking seconds and scrolling title readable
             samples = src.take()[-args.rate // 5:]
             left, right = samples[:, 0], samples[:, 1]
-            if goniometer:  # rotate 45 degrees: mono = vertical, out of phase = sideways
+            if mode == "gonio":  # rotate 45 degrees: mono = vertical, out of phase = sideways
                 x, y = (left - right) * 0.7071, (left + right) * 0.7071
             else:
                 x, y = left, right
@@ -713,58 +1234,100 @@ def main():
                 cur = float(np.max(np.hypot(x, y)))
                 peak = max(cur, peak * math.exp(-dt / 1.5), 0.01)
             screen.decay(dt, tau_f, tau_g)
-            if outline is None:
+
+            # What the beam draws: a path (video frame, image, clock text), or the sound itself
+            path, status = None, ""
+            if video:
+                fr = video.frame(dt)
+                if video.error and not video.frames:
+                    path = text_path("CAN'T PLAY THAT", 0.09)
+                    status = "VIDEO " + video.name + " (error: " + video.error + ")"
+                elif fr == "loading":
+                    path = text_path("TRACING %d%%" % (100 * video.progress()), 0.11)
+                    status = "VIDEO " + video.name + " (tracing)"
+                else:
+                    path = fr
+                    status = "VIDEO %s %d:%02d%s" % (video.name, int(video.t) // 60, int(video.t) % 60,
+                                                     " (tracing…)" if video.stalled else "")
+            elif outline:
+                path, status = outline, "IMAGE " + image_name
+            elif mode == "clock":
+                path, status = clock_path(now_playing, scroll), "CLOCK"
+            else:
+                status = MODE_NAMES[mode]
+
+            if path is not None or video:
+                if path is not None and len(path[0]):
+                    ox, oy, blank = path
+                    n = len(ox)
+                    # Bass: low-frequency energy against its own recent average
+                    mono = samples[-16384:].mean(axis=1) if len(samples) else np.zeros(1)
+                    spec = np.abs(np.fft.rfft(mono))
+                    freqs = np.fft.rfftfreq(len(mono), 1 / src.rate)
+                    bass = float(spec[(freqs > 30) & (freqs < 160)].sum())
+                    loud = float(np.sqrt(np.mean(mono ** 2)))
+                    if bass_avg <= 1e-6 and bass > 1e-4:  # first real sound: start from it,
+                        bass_avg, loud_avg = bass, loud      # or everything looks like a bass hit
+                    bass_avg += (bass - bass_avg) * min(dt / 2.0, 1)
+                    loud_avg += (loud - loud_avg) * min(dt / 2.0, 1)
+                    kick = min(max(bass / (bass_avg + 1e-9) - 1, 0), 1.5) if bass > 1e-4 else 0
+                    bass_env = max(kick, bass_env * math.exp(-dt / 0.18))
+                    size_k = 1 + 0.15 * bass_env
+                    bright = min(max(0.35 + 0.65 * loud / (loud_avg + 1e-9), 0.3), 2.0) \
+                        if loud > 1e-4 else 0.35
+                    if outline is None and video is None:
+                        bright = max(bright, 0.8)  # clock stays readable in silence
+                    # The music itself is added to the beam deflection, like feeding
+                    # the picture and the audio into the same scope inputs
+                    if len(x):
+                        pick = (np.arange(n) * len(x) // n)
+                        wx, wy = x[pick] / peak, y[pick] / peak
+                    else:
+                        wx = wy = 0
+                    # how far the music wiggles the lines: less for text and video
+                    # frames, where too much smears the detail into blobs
+                    wob = (0.05 if outline is not None else 0.015 if video else 0.008) * gain
+                    bx = (ox * size_k + wx * wob) * screen.R
+                    by = (oy * size_k + wy * wob) * screen.R
+                    lit_len = float(np.hypot(np.diff(bx), np.diff(by))[~blank[1:]].sum())
+                    screen.last_pt = None
+                    screen.trace(screen.cx + bx / screen.aspect, screen.cy - by,
+                                 n / dt, power * bright * beam * max(lit_len, 1) / 700,
+                                 tau_f, tau_g, blank)
+            elif mode == "wave":
+                # Classic scope: the sound wave sweeping left to right, triggered so it stands still
+                win = max(int(timebase * src.rate), 16)
+                keep = max(3 * win, src.rate // 4)
+                wave_buf = np.concatenate([wave_buf, (left + right) / 2])[-keep:]
+                mono = wave_buf
+                seg = trigger(mono, win, last_wave) if len(mono) else np.zeros(0)
+                last_wave = seg
+                if len(seg) > 1:
+                    wpeak = max(float(np.max(np.abs(mono))), 0.01)
+                    scale = (0.8 / wpeak if auto else 1.0) * gain * screen.R
+                    sweep = np.linspace(-1, 1, len(seg)) * screen.R
+                    screen.last_pt = None  # the beam is blanked while it flies back
+                    screen.trace(screen.cx + sweep / screen.aspect, screen.cy - seg * scale,
+                                 src.rate, power * beam * min(dt / timebase, 8), tau_f, tau_g)
+                status = "WAVE %.1fms/div" % (timebase * 100)
+            else:
                 scale = (0.92 / peak if auto else 1.0) * gain * screen.R
                 screen.trace(screen.cx + x * scale / screen.aspect, screen.cy - y * scale,
-                             src.rate, power, tau_f, tau_g)
-            else:
-                ox, oy, blank = outline
-                n = len(ox)
-                # Bass: low-frequency energy against its own recent average
-                mono = samples[-16384:].mean(axis=1) if len(samples) else np.zeros(1)
-                spec = np.abs(np.fft.rfft(mono))
-                freqs = np.fft.rfftfreq(len(mono), 1 / src.rate)
-                bass = float(spec[(freqs > 30) & (freqs < 160)].sum())
-                loud = float(np.sqrt(np.mean(mono ** 2)))
-                if bass_avg <= 1e-6 and bass > 1e-4:  # first real sound: start from it,
-                    bass_avg, loud_avg = bass, loud      # or everything looks like a bass hit
-                bass_avg += (bass - bass_avg) * min(dt / 2.0, 1)
-                loud_avg += (loud - loud_avg) * min(dt / 2.0, 1)
-                kick = min(max(bass / (bass_avg + 1e-9) - 1, 0), 1.5) if bass > 1e-4 else 0
-                bass_env = max(kick, bass_env * math.exp(-dt / 0.18))
-                size_k = 1 + 0.15 * bass_env
-                bright = min(max(0.35 + 0.65 * loud / (loud_avg + 1e-9), 0.3), 2.0) \
-                    if loud > 1e-4 else 0.35
-                # The music itself is added to the beam deflection, like feeding
-                # the picture and the audio into the same scope inputs
-                if len(x):
-                    pick = (np.arange(n) * len(x) // n)
-                    wx, wy = x[pick] / peak, y[pick] / peak
-                else:
-                    wx = wy = 0
-                wob = 0.05 * gain
-                bx = (ox * size_k + wx * wob) * screen.R
-                by = (oy * size_k + wy * wob) * screen.R
-                lit_len = float(np.hypot(np.diff(bx), np.diff(by))[~blank[1:]].sum())
-                screen.last_pt = None
-                screen.trace(screen.cx + bx / screen.aspect, screen.cy - by,
-                             n / dt, power * bright * max(lit_len, 1) / 700,
-                             tau_f, tau_g, blank)
+                             src.rate, power * beam, tau_f, tau_g)
 
             lines = screen.render(palette, show_grat)
             buf = ["\x1b[H"]
             for r, line in enumerate(lines):
                 buf.append("\x1b[%d;1H%s" % (r + 1, line))
             if show_info:
-                info = (" CRT-SCOPE │ %s │ %s │ %s %s%.1fx │ glow %.1fs │ beam %d │ %dkHz │ %dfps"
-                        "   Tab images  p m [ ] i I + - a g o < > h q"
-                        % (PHOSPHORS[ph][0].strip(),
-                           ("IMAGE " + image_name) if outline else
-                           "GONIO" if goniometer else "XY",
-                           "wobble" if outline else "gain",
-                           "auto·" if auto and not outline else "",
-                           gain if outline else (0.92 / peak if auto else 1) * gain,
-                           tau_g, power, src.rate // 1000, fps))
+                xy = path is None and mode in ("xy", "gonio")
+                info = (" CRT-SCOPE │ %s │ %s │ %s %s%.1fx │ glow %.1fs │ beam %d │ flaws %s │ %dkHz │ %dfps"
+                        "   Tab images/videos  m p [ ] i I + - t T f a g o < > h q"
+                        % (PHOSPHORS[ph][0].strip(), status,
+                           "gain" if xy or mode == "wave" and path is None else "wobble",
+                           "auto·" if auto and path is None else "",
+                           (0.92 / peak if auto else 1) * gain if xy else gain,
+                           tau_g, power, FLAWS[flaws], src.rate // 1000, fps))
                 buf.append("\x1b[%d;1H%s%s\x1b[K" % (rows, fg(INFO_RGB), info[:cols]))
             if picker:
                 buf.append(picker.draw(cols, plot_rows))
@@ -783,6 +1346,8 @@ def main():
         if old:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
         src.close()
+        if video:
+            video.close()
 
 
 if __name__ == "__main__":
