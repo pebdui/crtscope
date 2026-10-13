@@ -40,7 +40,7 @@ the way people play "Bad Apple!!" on real oscilloscopes. Black-and-white
 silhouettes work best; busy cartoons turn into a tangle of lines.
 
 <p align="center">
-  <img src="screenshots/videos.png" width="100%" alt="Bad Apple, Neco-Arc and a dancing cat traced by the beam">
+  <img src="screenshots/videos.gif" width="100%" alt="Bad Apple, Neco-Arc and a dancing cat playing as traced outlines on the tube">
 </p>
 
 ```sh
