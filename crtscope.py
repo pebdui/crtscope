@@ -380,7 +380,7 @@ def load_outline(path, max_points=4000):
     x -= (x.max() + x.min()) / 2
     y -= (y.max() + y.min()) / 2
     r = np.hypot(x, y).max() or 1
-    return x / r * 0.9, y / r * 0.9, blank
+    return x / r * 0.8, y / r * 0.8, blank  # leaves room for bass pulse + wobble
 
 
 # ----------------------------------------------------------------- main ----

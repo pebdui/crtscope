@@ -8,6 +8,11 @@ down, so stereo sound draws Lissajous figures. The beam leaves phosphor glow
 behind that fades over time, and it burns brighter where it moves slowly, just
 like a real tube. Round glass face, bezel, etched graticule, dimmer edges.
 
+<p align="center">
+  <img src="screenshots/lissajous.png" width="49%" alt="A 3:2 Lissajous figure glowing on the round tube">
+  <img src="screenshots/image.png" width="49%" alt="The beam tracing a smiley face">
+</p>
+
 ## Trace an image
 
 Give it a picture and the beam draws its outlines instead of the Lissajous
@@ -25,6 +30,8 @@ into a lot of little squiggles. Transparent PNGs use their shape's edge.
 `+` / `-` set how strongly the music bends the lines.
 
 ## Phosphors
+
+![The four phosphors side by side](screenshots/phosphors.png)
 
 | # | Phosphor | Look |
 | --- | --- | --- |
