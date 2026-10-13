@@ -5,11 +5,15 @@ Left channel moves the beam sideways, right channel moves it up and down, so
 stereo music draws Lissajous figures. The beam leaves phosphor glow behind that
 fades over time, and it glows brighter where it moves slowly.
 
+Give it an image (crtscope picture.png) and the beam traces the picture's
+outlines instead: the music bends the lines, bass makes it pulse, and loudness
+makes the beam burn brighter.
+
 Keys (while running):
   p      next phosphor (P7 radar, P1 green, P12 orange, P31 green-short)
   m      XY mode / goniometer mode (mono shows as a vertical line)
   [ ]    shorter / longer afterglow     i / I   dimmer / brighter beam
-  + / -  gain                           a       auto gain on/off
+  + / -  gain (wobble, with an image)   a       auto gain on/off
   g      graticule on/off               o       round tube / square screen
   < >    squash / stretch sideways, if your terminal makes the tube oval
   h      hide the info bar              q / Esc quit
@@ -208,17 +212,22 @@ class Screen:
         self.flash *= math.exp(-dt / tau_f)
         self.glow *= math.exp(-dt / tau_g)
 
-    def trace(self, px, py, rate, power, tau_f, tau_g):
+    def trace(self, px, py, rate, power, tau_f, tau_g, blank=None):
         """Sweep the beam through the points. Every sample gets the same beam
-        time, spread along its path, so slow parts of the trace glow brightest."""
+        time, spread along its path, so slow parts of the trace glow brightest.
+        blank[i] switches the beam off while it moves to point i."""
         if len(px) == 0:
             return
+        if blank is None:
+            blank = np.zeros(len(px), bool)
         if self.last_pt is not None:  # carry on from where the last frame ended
             px = np.concatenate([[self.last_pt[0]], px])
             py = np.concatenate([[self.last_pt[1]], py])
+            blank = np.concatenate([[False], blank])
         self.last_pt = (px[-1], py[-1])
         if len(px) < 2:
             px, py = np.repeat(px, 2), np.repeat(py, 2)
+            blank = np.repeat(blank, 2)
         dx, dy = np.diff(px), np.diff(py)
         steps = np.clip(np.ceil(np.hypot(dx, dy)), 1, 48).astype(np.int64)
         total = int(steps.sum())
@@ -230,7 +239,7 @@ class Screen:
         t = (np.arange(total) - start) / steps[seg]
         x = (px[:-1][seg] + dx[seg] * t).astype(np.int64)
         y = (py[:-1][seg] + dy[seg] * t).astype(np.int64)
-        energy = (1.0 / rate) / steps[seg]
+        energy = (1.0 / rate) / steps[seg] * ~blank[1:][seg]
         ok = (x >= 0) & (x < self.W) & (y >= 0) & (y < self.H)
         x, y, energy = x[ok], y[ok], energy[ok]
         dep = np.bincount(y * self.W + x, weights=energy, minlength=self.W * self.H)
@@ -270,6 +279,110 @@ class Screen:
         return ["".join(row) for row in tokens]
 
 
+# ---------------------------------------------------------------- image ----
+
+
+def load_outline(path, max_points=4000):
+    """Turn an image into one beam path along its outlines.
+    Returns x, y (fitted inside the unit circle, y up) and a blank mask that is
+    True where the beam has to jump to a separate shape with the beam off."""
+    from PIL import Image, ImageOps
+
+    im = ImageOps.exif_transpose(Image.open(path))
+    im.thumbnail((240, 240))
+    rgba = np.asarray(im.convert("RGBA"), dtype=float) / 255
+    alpha = rgba[..., 3]
+    lum = rgba[..., :3] @ np.array([0.299, 0.587, 0.114]) * alpha
+
+    def edges(a):
+        a = np.pad(a, 1, mode="edge")
+        a = sum(a[dy:dy + a.shape[0] - 2, dx:dx + a.shape[1] - 2] / 9  # soften
+                for dy in range(3) for dx in range(3))
+        a = np.pad(a, 1, mode="edge")
+        gx = (a[1:-1, 2:] - a[1:-1, :-2]) * 2 + a[:-2, 2:] - a[:-2, :-2] + a[2:, 2:] - a[2:, :-2]
+        gy = (a[2:, 1:-1] - a[:-2, 1:-1]) * 2 + a[2:, :-2] - a[:-2, :-2] + a[2:, 2:] - a[:-2, 2:]
+        return gx, gy
+
+    gx1, gy1 = edges(lum)
+    gx2, gy2 = edges(alpha)
+    use2 = np.hypot(gx2, gy2) > np.hypot(gx1, gy1)
+    gx, gy = np.where(use2, gx2, gx1), np.where(use2, gy2, gy1)
+    mag = np.hypot(gx, gy)
+
+    # Keep only the crest of each edge so lines come out one pixel thin
+    m = np.pad(mag, 1)
+    h, w = mag.shape
+    ang = (np.round(np.arctan2(gy, gx) / (np.pi / 4)) % 4).astype(int)
+    nbr = {0: (0, 1), 1: (1, 1), 2: (1, 0), 3: (1, -1)}
+    crest = np.zeros_like(mag, bool)
+    for a, (dy, dx) in nbr.items():
+        fwd = m[1 + dy:1 + dy + h, 1 + dx:1 + dx + w]
+        back = m[1 - dy:1 - dy + h, 1 - dx:1 - dx + w]
+        crest |= (ang == a) & (mag >= fwd) & (mag >= back)
+    strong = mag > max(0.25 * np.percentile(mag[mag > 0], 99) if (mag > 0).any() else 1, 0.05)
+    ys, xs = np.nonzero(crest & strong)
+    if len(xs) < 2:
+        raise ValueError("couldn't find any outlines in that image")
+
+    # Walk the edge pixels: follow neighbours, jump (beam off) to the nearest
+    # unvisited pixel when a line ends.
+    where = {(int(y), int(x)): i for i, (y, x) in enumerate(zip(ys, xs))}
+    visited = np.zeros(len(xs), bool)
+    order, jumps = [], []
+    cur = 0
+    steps8 = [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+    for _ in range(len(xs)):
+        visited[cur] = True
+        order.append(cur)
+        y, x = int(ys[cur]), int(xs[cur])
+        nxt = None
+        for dy, dx in steps8:
+            j = where.get((y + dy, x + dx))
+            if j is not None and not visited[j]:
+                nxt = j
+                break
+        if nxt is None:
+            left = np.flatnonzero(~visited)
+            if not len(left):
+                break
+            nxt = left[np.argmin((xs[left] - x) ** 2 + (ys[left] - y) ** 2)]
+            jumps.append(len(order))
+        cur = nxt
+    order = np.array(order)
+    blank = np.zeros(len(order), bool)
+    blank[[j for j in jumps if j < len(order)]] = True
+
+    # Drop specks (strokes shorter than 6 pixels)
+    starts = np.concatenate([[0], np.flatnonzero(blank)])
+    ends = np.concatenate([starts[1:], [len(order)]])
+    keep = np.zeros(len(order), bool)
+    for a, b in zip(starts, ends):
+        if b - a >= 6:
+            keep[a:b] = True
+    if keep.sum() >= 2:
+        newstart = np.zeros(len(order), bool)
+        newstart[starts] = True
+        order, newstart = order[keep], newstart[keep]
+        blank = newstart
+        blank[0] = False
+
+    # Thin out very busy images so the beam can redraw them every frame
+    if len(order) > max_points:
+        k = math.ceil(len(order) / max_points)
+        idx = np.arange(0, len(order), k)
+        cs = np.cumsum(blank)
+        prev = np.concatenate([[-1], idx[:-1]])
+        blank = (cs[idx] - np.where(prev >= 0, cs[np.maximum(prev, 0)], 0)) > 0
+        order = order[idx]
+
+    x = xs[order].astype(float)
+    y = -ys[order].astype(float)
+    x -= (x.max() + x.min()) / 2
+    y -= (y.max() + y.min()) / 2
+    r = np.hypot(x, y).max() or 1
+    return x / r * 0.9, y / r * 0.9, blank
+
+
 # ----------------------------------------------------------------- main ----
 
 
@@ -288,6 +401,7 @@ def measure_aspect():
 
 def main():
     ap = argparse.ArgumentParser(description="1960s military CRT audio scope for the terminal")
+    ap.add_argument("image", nargs="?", help="image for the beam to trace (png, jpg, ...)")
     ap.add_argument("--rate", type=int, default=192000,
                     help="capture sample rate (default 192000)")
     ap.add_argument("--mic", action="store_true", help="use the microphone instead")
@@ -301,6 +415,12 @@ def main():
     ap.add_argument("--frames", type=int, default=0, help=argparse.SUPPRESS)  # for testing
     args = ap.parse_args()
 
+    outline = None
+    if args.image:
+        try:
+            outline = load_outline(args.image)
+        except Exception as e:  # unreadable file, not an image, no edges...
+            sys.exit(f"crtscope: {args.image}: {e}")
     src = Demo(args.rate) if args.demo else Audio(args.rate, args.mic)
     ph = args.phosphor - 1
     palette = build_palette(PHOSPHORS[ph])
@@ -314,6 +434,8 @@ def main():
     nudge = 1.0  # manual fine-tune on top of the measured aspect
     show_info = True
     peak = 0.05
+    bass_avg = loud_avg = 1e-6
+    bass_env = 0.0
 
     fd = sys.stdin.fileno()
     is_tty = os.isatty(fd)
@@ -400,20 +522,56 @@ def main():
             if len(x):
                 cur = float(np.max(np.hypot(x, y)))
                 peak = max(cur, peak * math.exp(-dt / 1.5), 0.01)
-            scale = (0.92 / peak if auto else 1.0) * gain * screen.R
             screen.decay(dt, tau_f, tau_g)
-            screen.trace(screen.cx + x * scale / screen.aspect, screen.cy - y * scale,
-                         src.rate, power, tau_f, tau_g)
+            if outline is None:
+                scale = (0.92 / peak if auto else 1.0) * gain * screen.R
+                screen.trace(screen.cx + x * scale / screen.aspect, screen.cy - y * scale,
+                             src.rate, power, tau_f, tau_g)
+            else:
+                ox, oy, blank = outline
+                n = len(ox)
+                # Bass: low-frequency energy against its own recent average
+                mono = samples[-16384:].mean(axis=1) if len(samples) else np.zeros(1)
+                spec = np.abs(np.fft.rfft(mono))
+                freqs = np.fft.rfftfreq(len(mono), 1 / src.rate)
+                bass = float(spec[(freqs > 30) & (freqs < 160)].sum())
+                loud = float(np.sqrt(np.mean(mono ** 2)))
+                bass_avg += (bass - bass_avg) * min(dt / 2.0, 1)
+                loud_avg += (loud - loud_avg) * min(dt / 2.0, 1)
+                kick = min(max(bass / (bass_avg + 1e-9) - 1, 0), 1.5) if bass > 1e-4 else 0
+                bass_env = max(kick, bass_env * math.exp(-dt / 0.18))
+                size_k = 1 + 0.15 * bass_env
+                bright = min(max(0.35 + 0.65 * loud / (loud_avg + 1e-9), 0.3), 2.0) \
+                    if loud > 1e-4 else 0.35
+                # The music itself is added to the beam deflection, like feeding
+                # the picture and the audio into the same scope inputs
+                if len(x):
+                    pick = (np.arange(n) * len(x) // n)
+                    wx, wy = x[pick] / peak, y[pick] / peak
+                else:
+                    wx = wy = 0
+                wob = 0.05 * gain
+                bx = (ox * size_k + wx * wob) * screen.R
+                by = (oy * size_k + wy * wob) * screen.R
+                lit_len = float(np.hypot(np.diff(bx), np.diff(by))[~blank[1:]].sum())
+                screen.last_pt = None
+                screen.trace(screen.cx + bx / screen.aspect, screen.cy - by,
+                             n / dt, power * bright * max(lit_len, 1) / 700,
+                             tau_f, tau_g, blank)
 
             lines = screen.render(palette, show_grat)
             buf = ["\x1b[H"]
             for r, line in enumerate(lines):
                 buf.append("\x1b[%d;1H%s" % (r + 1, line))
             if show_info:
-                info = (" CRT-SCOPE │ %s │ %s │ gain %s%.1fx │ glow %.1fs │ beam %d │ %dkHz │ %dfps"
+                info = (" CRT-SCOPE │ %s │ %s │ %s %s%.1fx │ glow %.1fs │ beam %d │ %dkHz │ %dfps"
                         "   p m [ ] i I + - a g o < > h q"
-                        % (PHOSPHORS[ph][0].strip(), "GONIO" if goniometer else "XY",
-                           "auto·" if auto else "", (0.92 / peak if auto else 1) * gain,
+                        % (PHOSPHORS[ph][0].strip(),
+                           ("IMAGE " + os.path.basename(args.image)) if outline else
+                           "GONIO" if goniometer else "XY",
+                           "wobble" if outline else "gain",
+                           "auto·" if auto and not outline else "",
+                           gain if outline else (0.92 / peak if auto else 1) * gain,
                            tau_g, power, src.rate // 1000, fps))
                 buf.append("\x1b[%d;1H%s%s\x1b[K" % (rows, fg(INFO_RGB), info[:cols]))
             out.write("".join(buf))

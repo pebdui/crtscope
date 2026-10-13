@@ -8,6 +8,22 @@ down, so stereo sound draws Lissajous figures. The beam leaves phosphor glow
 behind that fades over time, and it burns brighter where it moves slowly, just
 like a real tube. Round glass face, bezel, etched graticule, dimmer edges.
 
+## Trace an image
+
+Give it a picture and the beam draws its outlines instead of the Lissajous
+pattern, like oscilloscope music that draws pictures. The music is fed into the
+same deflection as the picture, so the lines wobble and ripple with the sound,
+bass hits make the picture pulse bigger, and loud parts make the beam burn
+brighter. In quiet moments it settles back to a dim, steady picture.
+
+```sh
+python3 crtscope.py logo.png
+```
+
+Logos, line art, icons and high-contrast pictures work best; busy photos turn
+into a lot of little squiggles. Transparent PNGs use their shape's edge.
+`+` / `-` set how strongly the music bends the lines.
+
 ## Phosphors
 
 | # | Phosphor | Look |
@@ -25,6 +41,7 @@ speakers are playing. Use a terminal with truecolor support.
 ```sh
 python3 crtscope.py               # listen to system audio at 192kHz
 python3 crtscope.py --demo        # 3:2 test tone, no audio needed
+python3 crtscope.py cat.png       # trace an image instead
 python3 crtscope.py --mic         # listen to the microphone instead
 python3 crtscope.py --phosphor 2 --square --fps 144
 ```
@@ -40,7 +57,7 @@ into a glowing ball of noise, as they would on a real scope.
 | `m` | XY / goniometer (mono shows as a vertical line) |
 | `[` / `]` | shorter / longer afterglow |
 | `i` / `I` | dimmer / brighter beam |
-| `+` / `-` | gain |
+| `+` / `-` | gain (how much the music bends the lines, with an image) |
 | `a` | auto gain on/off |
 | `g` | graticule on/off |
 | `o` | round tube / square screen |
