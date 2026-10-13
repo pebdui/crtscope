@@ -44,5 +44,6 @@ into a glowing ball of noise, as they would on a real scope.
 | `a` | auto gain on/off |
 | `g` | graticule on/off |
 | `o` | round tube / square screen |
+| `<` / `>` | squash / stretch sideways (only needed if your terminal hides its cell size) |
 | `h` | hide the info bar |
 | `q` / Esc | quit |

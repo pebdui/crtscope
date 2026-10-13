@@ -11,15 +11,18 @@ Keys (while running):
   [ ]    shorter / longer afterglow     i / I   dimmer / brighter beam
   + / -  gain                           a       auto gain on/off
   g      graticule on/off               o       round tube / square screen
+  < >    squash / stretch sideways, if your terminal makes the tube oval
   h      hide the info bar              q / Esc quit
 """
 
 import argparse
+import fcntl
 import math
 import os
 import select
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import termios
@@ -155,17 +158,20 @@ NONE_IDX = GRAT_IDX + 2
 class Screen:
     """The tube face at braille-dot resolution (2 dots wide, 4 tall per cell)."""
 
-    def __init__(self, cols, rows, round_tube):
+    def __init__(self, cols, rows, round_tube, aspect):
         self.cols, self.rows = cols, rows
         self.W, self.H = cols * 2, rows * 4
         self.cx, self.cy = self.W / 2, self.H / 2
-        self.R = max(4.0, min(self.W, self.H) / 2 - 4)
+        # aspect = dot width / dot height on screen. Below 1 means dots are
+        # narrow, so a circle needs more dots across than down.
+        self.aspect = aspect
+        self.R = max(4.0, min(self.W * aspect, self.H) / 2 - 4)  # in dot heights
         self.flash = np.zeros((self.H, self.W))
         self.glow = np.zeros((self.H, self.W))
         self.last_pt = None
 
         yy, xx = np.mgrid[0:self.H, 0:self.W]
-        u = (xx + 0.5 - self.cx) / self.R
+        u = (xx + 0.5 - self.cx) * aspect / self.R
         v = (yy + 0.5 - self.cy) / self.R
         rr = np.hypot(u, v)
         if round_tube:
@@ -182,7 +188,7 @@ class Screen:
         grat = np.zeros((self.H, self.W), bool)
         div = self.R / 5
         for k in range(-5, 6):
-            gx = int(round(self.cx + k * div))
+            gx = int(round(self.cx + k * div / aspect))
             gy = int(round(self.cy + k * div))
             if 0 <= gx < self.W:
                 grat[::3, gx] = True
@@ -190,7 +196,7 @@ class Screen:
                 grat[gy, ::3] = True
         icx, icy = int(self.cx), int(self.cy)
         for k in range(-25, 26):
-            tx = int(round(self.cx + k * div / 5))
+            tx = int(round(self.cx + k * div / 5 / aspect))
             ty = int(round(self.cy + k * div / 5))
             if 0 <= tx < self.W:
                 grat[max(icy - 1, 0):icy + 2, tx] = True
@@ -267,6 +273,19 @@ class Screen:
 # ----------------------------------------------------------------- main ----
 
 
+def measure_aspect():
+    """Braille dot width / height from the terminal's real cell size in pixels.
+    Fonts are rarely exactly 1:2, which would squash the tube into an oval."""
+    try:
+        packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols, xpix, ypix = struct.unpack("HHHH", packed)
+        if rows and cols and xpix and ypix:
+            return (xpix / cols / 2) / (ypix / rows / 4)
+    except OSError:
+        pass
+    return 1.0  # terminal won't say; assume 1:2 cells (fix with --aspect or < >)
+
+
 def main():
     ap = argparse.ArgumentParser(description="1960s military CRT audio scope for the terminal")
     ap.add_argument("--rate", type=int, default=192000,
@@ -276,6 +295,8 @@ def main():
     ap.add_argument("--fps", type=int, default=60)
     ap.add_argument("--phosphor", type=int, default=1, choices=range(1, len(PHOSPHORS) + 1),
                     help="1=P7 radar 2=P1 green 3=P12 orange 4=P31 green-short")
+    ap.add_argument("--aspect", type=float, default=0,
+                    help="dot width/height override if the tube isn't round (e.g. 0.9)")
     ap.add_argument("--square", action="store_true", help="square screen instead of round tube")
     ap.add_argument("--frames", type=int, default=0, help=argparse.SUPPRESS)  # for testing
     args = ap.parse_args()
@@ -290,6 +311,7 @@ def main():
     auto = True
     show_grat = True
     round_tube = not args.square
+    nudge = 1.0  # manual fine-tune on top of the measured aspect
     show_info = True
     peak = 0.05
 
@@ -349,6 +371,12 @@ def main():
                 elif k == "o":
                     round_tube = not round_tube
                     size = None
+                elif k in ("<", ","):
+                    nudge /= 1.02
+                    size = None
+                elif k in (">", "."):
+                    nudge *= 1.02
+                    size = None
                 elif k == "h":
                     show_info = not show_info
                     size = None
@@ -357,7 +385,8 @@ def main():
             plot_rows = rows - 1 if show_info else rows
             if (cols, plot_rows) != size:
                 size = (cols, plot_rows)
-                screen = Screen(cols, plot_rows, round_tube)
+                aspect = (args.aspect or measure_aspect()) * nudge
+                screen = Screen(cols, plot_rows, round_tube, aspect)
                 out.write("\x1b[2J")
 
             _, _, tau_f, _, tau_g = PHOSPHORS[ph]
@@ -373,7 +402,7 @@ def main():
                 peak = max(cur, peak * math.exp(-dt / 1.5), 0.01)
             scale = (0.92 / peak if auto else 1.0) * gain * screen.R
             screen.decay(dt, tau_f, tau_g)
-            screen.trace(screen.cx + x * scale, screen.cy - y * scale,
+            screen.trace(screen.cx + x * scale / screen.aspect, screen.cy - y * scale,
                          src.rate, power, tau_f, tau_g)
 
             lines = screen.render(palette, show_grat)
@@ -382,7 +411,7 @@ def main():
                 buf.append("\x1b[%d;1H%s" % (r + 1, line))
             if show_info:
                 info = (" CRT-SCOPE │ %s │ %s │ gain %s%.1fx │ glow %.1fs │ beam %d │ %dkHz │ %dfps"
-                        "   p m [ ] i I + - a g o h q"
+                        "   p m [ ] i I + - a g o < > h q"
                         % (PHOSPHORS[ph][0].strip(), "GONIO" if goniometer else "XY",
                            "auto·" if auto else "", (0.92 / peak if auto else 1) * gain,
                            tau_g, power, src.rate // 1000, fps))
