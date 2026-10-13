@@ -101,10 +101,77 @@ Green, up to `--phosphor 19` for 15 White.
 
 ![The 15 Apple II colours](screenshots/apple2.png)
 
+## Install
+
+### Linux
+
+Get the code:
+
+```sh
+git clone https://github.com/plebdui/crtscope.git
+cd crtscope
+```
+
+Install what it needs (pick your system). ffmpeg is only for videos, and the
+GObject package only shows the song title in clock mode; everything else works
+without them.
+
+```sh
+# Ubuntu / Debian / Mint / Pop!_OS
+sudo apt install git python3 python3-numpy python3-pil python3-gi ffmpeg pulseaudio-utils
+
+# Arch / Manjaro / EndeavourOS
+sudo pacman -S --needed git python python-numpy python-pillow python-gobject ffmpeg libpulse
+
+# Fedora
+sudo dnf install git python3 python3-numpy python3-pillow python3-gobject ffmpeg-free pulseaudio-utils
+
+# openSUSE
+sudo zypper install git python3 python3-numpy python3-Pillow python3-gobject ffmpeg pulseaudio-utils
+```
+
+Run it:
+
+```sh
+python3 crtscope.py --demo        # a test tone, to check it works
+python3 crtscope.py               # whatever your speakers are playing
+```
+
+### Windows
+
+In PowerShell (Windows Terminal is best; the old console window is slow):
+
+```powershell
+winget install -e --id Git.Git
+winget install -e --id Python.Python.3.12
+winget install -e --id Gyan.FFmpeg        # only needed for videos
+```
+
+Close and reopen PowerShell so it finds the new programs, then:
+
+```powershell
+git clone https://github.com/plebdui/crtscope.git
+cd crtscope
+python -m pip install numpy pillow soundcard
+python crtscope.py --demo         # a test tone, to check it works
+python crtscope.py                # whatever your speakers are playing
+```
+
+It records what your speakers play through Windows' own loopback capture, at
+whatever rate your sound device uses. The song title in clock mode is
+Linux-only for now.
+
+### Update
+
+```sh
+cd crtscope
+git pull
+```
+
 ## Run it
 
-Needs Python 3, numpy, and `parec` (PulseAudio or PipeWire) to hear what your
-speakers are playing. Use a terminal with truecolor support.
+Use a terminal with truecolor support (on Windows, use `python` instead of
+`python3`).
 
 ```sh
 python3 crtscope.py               # listen to system audio at 192kHz
@@ -116,22 +183,6 @@ python3 crtscope.py --flaws worn  # an old, tired tube (also: off, subtle)
 python3 crtscope.py --phosphor 2 --square --fps 144
 python3 crtscope.py --phosphor 10       # Apple II 06 Purple
 ```
-
-### Windows
-
-Install Python 3 from [python.org](https://www.python.org/downloads/), then in a
-terminal:
-
-```bat
-pip install numpy pillow soundcard
-python crtscope.py
-```
-
-It records what your speakers play through Windows' own loopback capture (no
-extra setup), at whatever rate your sound device uses. Run it in **Windows
-Terminal**; the old console window is much slower. To play videos (not GIFs)
-install ffmpeg too, for example `winget install ffmpeg`. The song title in clock
-mode is Linux-only for now.
 
 Simple tones, synth pads and "oscilloscope music" look best. Busy mixes turn
 into a glowing ball of noise, as they would on a real scope.
