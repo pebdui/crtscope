@@ -26,19 +26,25 @@ Keys (while running):
 
 import argparse
 import bisect
-import fcntl
 import math
 import os
-import select
 import shutil
 import signal
 import struct
 import subprocess
 import sys
-import termios
 import threading
 import time
-import tty
+
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+else:
+    import fcntl
+    import select
+    import termios
+    import tty
 
 import numpy as np
 
@@ -54,12 +60,13 @@ class Audio:
         self.pending = 0
         self.lock = threading.Lock()
         self.proc = None
+        self.dead = None  # why the audio stopped, if it did (e.g. no sound server)
         device = "@DEFAULT_SOURCE@" if use_mic else "@DEFAULT_MONITOR@"
         try:
             self.proc = subprocess.Popen(
                 ["parec", f"--device={device}", "--format=float32le",
                  f"--rate={rate}", "--channels=2", "--latency-msec=10"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except FileNotFoundError:
             sys.exit("crtscope: parec not found (it comes with pipewire-pulse / libpulse)")
         threading.Thread(target=self._reader, daemon=True).start()
@@ -69,17 +76,21 @@ class Audio:
         leftover = b""
         while True:
             data = os.read(fd, 65536)
-            if not data:
+            if not data:  # parec quit: usually no PipeWire / PulseAudio to listen to
+                err = self.proc.stderr.read().decode(errors="ignore").strip().splitlines()
+                self.dead = (err[-1] if err else "parec stopped").replace("pa_context_connect() failed: ", "")
                 return
             data = leftover + data
             usable = len(data) // 8 * 8  # one stereo frame = 2 x float32
             leftover = data[usable:]
-            frames = np.frombuffer(data[:usable], dtype=np.float32).reshape(-1, 2)
-            with self.lock:
-                self.chunks.append(frames)
-                self.pending += len(frames)
-                while self.pending > self.rate and len(self.chunks) > 1:  # keep <= 1s
-                    self.pending -= len(self.chunks.pop(0))
+            self._push(np.frombuffer(data[:usable], dtype=np.float32).reshape(-1, 2))
+
+    def _push(self, frames):
+        with self.lock:
+            self.chunks.append(frames)
+            self.pending += len(frames)
+            while self.pending > self.rate and len(self.chunks) > 1:  # keep <= 1s
+                self.pending -= len(self.chunks.pop(0))
 
     def take(self):
         with self.lock:
@@ -91,6 +102,59 @@ class Audio:
     def close(self):
         if self.proc:
             self.proc.kill()
+
+
+class WindowsAudio(Audio):
+    """Windows: records what the speakers play through WASAPI loopback, using
+    the soundcard package (pip install soundcard)."""
+
+    def __init__(self, rate, use_mic=False):
+        self.rate = rate
+        self.chunks = []
+        self.pending = 0
+        self.lock = threading.Lock()
+        self.proc = None
+        self.dead = None
+        self.closed = False
+        self.use_mic = use_mic
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        try:
+            import soundcard as sc  # imported here: it sets up Windows audio (COM) for this thread
+            if self.use_mic:
+                dev = sc.default_microphone()
+            else:
+                dev = sc.get_microphone(sc.default_speaker().id, include_loopback=True)
+            # Windows only records in formats the sound device accepts: try stereo at
+            # the usual rates, then mono (some devices, and Wine, only loop back mono)
+            rates = [self.rate] + [r for r in (48000, 44100, 96000, 192000, 32000) if r != self.rate]
+            tries = [(r, ch) for ch in (2, 1) for r in rates]
+            for i, (rate, ch) in enumerate(tries):
+                try:
+                    rec = dev.recorder(samplerate=rate, channels=ch, blocksize=1024)
+                    rec.__enter__()
+                    break
+                except RuntimeError as e:
+                    if "unsupported format" not in str(e) or i == len(tries) - 1:
+                        raise
+            self.rate = rate
+            self.mono = ch == 1
+            try:
+                while not self.closed:
+                    data = np.asarray(rec.record(numframes=1024), dtype=np.float32)
+                    if data.ndim == 1 or data.shape[1] == 1:  # mono device: same on both sides
+                        data = np.repeat(data.reshape(-1, 1), 2, axis=1)
+                    self._push(data[:, :2])
+            finally:
+                rec.__exit__(None, None, None)
+        except ImportError:
+            self.dead = "needs the soundcard package: pip install soundcard"
+        except Exception as e:  # no loopback device, unsupported rate...
+            self.dead = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+
+    def close(self):
+        self.closed = True
 
 
 class Demo:
@@ -563,7 +627,7 @@ class Video:
                     durations.append(d)
                     yield rgba
 
-            ctx = multiprocessing.get_context("forkserver")
+            ctx = multiprocessing.get_context("spawn" if IS_WINDOWS else "forkserver")
             with ctx.Pool(max(1, (os.cpu_count() or 2) - 2)) as pool:
                 t = 0.0
                 for i, path in enumerate(pool.imap(_trace_frame, frames(), chunksize=4)):
@@ -620,11 +684,13 @@ class Video:
         if i >= len(self.frames) - 1 and not self.done:
             # tracing fell behind (rare): hold this frame and pause the sound
             if not self.stalled:
-                self._sound(signal.SIGSTOP)
+                if hasattr(signal, "SIGSTOP"):  # Windows can't pause a process; it just plays on
+                    self._sound(signal.SIGSTOP)
                 self.stalled = True
         else:
             if self.stalled:
-                self._sound(signal.SIGCONT)
+                if hasattr(signal, "SIGCONT"):
+                    self._sound(signal.SIGCONT)
                 self.stalled = False
             self.t = t
         i = max(0, min(bisect.bisect_right(self.starts, self.t) - 1, len(self.frames) - 1))
@@ -975,9 +1041,32 @@ KEY_SEQS = {"\x1b[A": "UP", "\x1b[B": "DOWN", "\x1b[C": "RIGHT", "\x1b[D": "LEFT
 KEY_NAMES = {"\r": "ENTER", "\n": "ENTER", "\t": "TAB", "\x7f": "BACKSPACE", "\x08": "BACKSPACE"}
 
 
+WIN_KEYS = {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT", "I": "PGUP", "Q": "PGDN"}
+
+
+def read_keys_windows():
+    """Windows console: special keys arrive as a prefix character plus a code."""
+    keys = []
+    while msvcrt.kbhit():
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            name = WIN_KEYS.get(msvcrt.getwch())
+            if name:
+                keys.append(name)
+        elif ch == "\x1b":
+            keys.append("ESC")
+        elif ch == "\x03":
+            raise KeyboardInterrupt
+        else:
+            keys.append(KEY_NAMES.get(ch, ch))
+    return keys
+
+
 def read_keys(fd):
     """Everything typed since last frame, with arrow keys etc. as one key each
     (they arrive as Esc + letters, which must not count as a lone Esc)."""
+    if IS_WINDOWS:
+        return read_keys_windows()
     data = b""
     while select.select([fd], [], [], 0)[0]:
         chunk = os.read(fd, 1024)
@@ -1011,6 +1100,24 @@ def read_keys(fd):
 def measure_aspect():
     """Braille dot width / height from the terminal's real cell size in pixels.
     Fonts are rarely exactly 1:2, which would squash the tube into an oval."""
+    if IS_WINDOWS:
+        try:  # the console font's cell size
+            class COORD(ctypes.Structure):
+                _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+            class FONT(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_ulong), ("nFont", ctypes.c_ulong), ("dwFontSize", COORD),
+                            ("FontFamily", ctypes.c_uint), ("FontWeight", ctypes.c_uint),
+                            ("FaceName", ctypes.c_wchar * 32)]
+            f = FONT()
+            f.cbSize = ctypes.sizeof(FONT)
+            h = ctypes.windll.kernel32.GetStdHandle(-11)
+            if ctypes.windll.kernel32.GetCurrentConsoleFontEx(h, False, ctypes.byref(f)) \
+                    and f.dwFontSize.X and f.dwFontSize.Y:
+                return (f.dwFontSize.X / 2) / (f.dwFontSize.Y / 4)
+        except Exception:
+            pass
+        return 1.0
     try:
         packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
         rows, cols, xpix, ypix = struct.unpack("HHHH", packed)
@@ -1029,8 +1136,8 @@ def main():
     ap = argparse.ArgumentParser(description="1960s military CRT audio scope for the terminal")
     ap.add_argument("image", nargs="?",
                     help="image to trace (png, jpg, ...) or a GIF / video to play as outlines")
-    ap.add_argument("--rate", type=int, default=192000,
-                    help="capture sample rate (default 192000)")
+    ap.add_argument("--rate", type=int, default=48000 if IS_WINDOWS else 192000,
+                    help="capture sample rate (default 192000; 48000 on Windows)")
     ap.add_argument("--mic", action="store_true", help="use the microphone instead")
     ap.add_argument("--demo", action="store_true", help="draw a test tone, no audio needed")
     ap.add_argument("--fps", type=int, default=60)
@@ -1066,7 +1173,12 @@ def main():
                 outline = load_outline(args.image)
             except Exception as e:  # unreadable file, not an image, no edges...
                 sys.exit(f"crtscope: {args.image}: {e}")
-    src = Demo(args.rate) if args.demo else Audio(args.rate, args.mic)
+    if args.demo:
+        src = Demo(args.rate)
+    elif IS_WINDOWS:
+        src = WindowsAudio(args.rate, args.mic)
+    else:
+        src = Audio(args.rate, args.mic)
     now_playing = NowPlaying()
     ph = args.phosphor - 1
     palette = build_palette(PHOSPHORS[ph])
@@ -1092,7 +1204,18 @@ def main():
 
     fd = sys.stdin.fileno()
     is_tty = os.isatty(fd)
-    old = termios.tcgetattr(fd) if is_tty else None
+    old = termios.tcgetattr(fd) if is_tty and not IS_WINDOWS else None
+    if IS_WINDOWS:
+        try:  # let the console understand colour/cursor escape codes, and print braille
+            k32 = ctypes.windll.kernel32
+            h = k32.GetStdHandle(-11)
+            con = ctypes.c_uint32()
+            if k32.GetConsoleMode(h, ctypes.byref(con)):
+                k32.SetConsoleMode(h, con.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            k32.SetConsoleOutputCP(65001)
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     out = sys.stdout
     screen = None
     size = None
@@ -1110,7 +1233,7 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     try:
-        if is_tty:
+        if is_tty and not IS_WINDOWS:
             tty.setcbreak(fd)
         out.write("\x1b[?1049h\x1b[?25l\x1b[2J")
         frame_time = 1.0 / args.fps
@@ -1253,6 +1376,12 @@ def main():
                 path, status = outline, "IMAGE " + image_name
             elif mode == "clock":
                 path, status = clock_path(now_playing, scroll), "CLOCK"
+            elif getattr(src, "dead", None):
+                # nothing to listen to: say so instead of showing an empty tube
+                path = join_paths(text_path("NO SIGNAL", 0.14), text_path("TRY --DEMO", 0.07, cy=-0.25))
+                status = "NO AUDIO: %s (%s try --demo)" % (
+                    src.dead, "are your speakers enabled in Sound settings?" if IS_WINDOWS
+                    else "is PipeWire / PulseAudio running?")
             else:
                 status = MODE_NAMES[mode]
 

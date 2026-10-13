@@ -117,6 +117,22 @@ python3 crtscope.py --phosphor 2 --square --fps 144
 python3 crtscope.py --phosphor 10       # Apple II 06 Purple
 ```
 
+### Windows
+
+Install Python 3 from [python.org](https://www.python.org/downloads/), then in a
+terminal:
+
+```bat
+pip install numpy pillow soundcard
+python crtscope.py
+```
+
+It records what your speakers play through Windows' own loopback capture (no
+extra setup), at whatever rate your sound device uses. Run it in **Windows
+Terminal**; the old console window is much slower. To play videos (not GIFs)
+install ffmpeg too, for example `winget install ffmpeg`. The song title in clock
+mode is Linux-only for now.
+
 Simple tones, synth pads and "oscilloscope music" look best. Busy mixes turn
 into a glowing ball of noise, as they would on a real scope.
 
